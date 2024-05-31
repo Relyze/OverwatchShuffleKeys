@@ -1,5 +1,5 @@
-# OverwatchShuffleKeys
-Overwatch 2 ShuffleKeys POC
+# Overwatch Shuffle Keys Replication
+Overwatch 2 ShuffleKeys Replication POC
 
 This won't work out of the box for everyone, since it doesn't handle every possible shuffle keys permutation correctly from my testing, but I have no use for it anymore, and haven't for nearly a year.
 I tested it on the latest Overwatch 2 version as of today, which is 2.10.1.60211, but they'll be moving away from this in the future at some point, so I felt like I may as well share it.
