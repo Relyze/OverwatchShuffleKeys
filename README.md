@@ -1,4 +1,4 @@
-![image](https://github.com/Relyze/OverwatchShuffleKeys/assets/43044221/026c4be9-04da-47b4-9060-87d1d203cf56)# OverwatchShuffleKeys
+# OverwatchShuffleKeys
 Overwatch 2 ShuffleKeys POC
 
 This won't work out of the box for everyone, since it doesn't handle every possible shuffle keys permutation correctly from my testing, but I have no use for it anymore, and haven't for nearly a year.
