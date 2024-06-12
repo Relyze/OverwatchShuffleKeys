@@ -1,0 +1,9 @@
+
+*.vsidx
+*.db
+*.db-shm
+*.db-wal
+*.ipch
+*.opendb
+x64/
+ShuffleKeys/x64

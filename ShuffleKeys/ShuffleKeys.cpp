@@ -5,18 +5,13 @@
 #include <unordered_map>
 #include <set>
 #include <map>
-#include <process.h>
+#include <process.h>	
 #include "idadefs.h"
+#include "scanner.h"
+
 static FILE* file = NULL;
-
-// Defined start and end offsets for better maintainability
-#define SHUFFLE_KEYS_START 0xB6630
-#define SHUFFLE_KEYS_END SHUFFLE_KEYS_START + 0x500 // idk, probably dont need any instructions past 280 bytes
-
-ZyanU8* shuffleKeysData = nullptr;
 static ZyanU64 retcheck_failed_address = 0;
-uint64_t baseAddress = 0;
-static void processJumpInstruction(ZydisDecoder& decoder, ZydisDecodedInstruction& instruction, ZydisDecodedOperand operands[], ZyanU64 baseAddress, ZyanUSize& offset, ZyanUSize functionSize) {
+static void processJumpInstruction(ZydisDecoder& decoder, ZydisDecodedInstruction& instruction, ZydisDecodedOperand operands[], ZyanU64 baseAddress, ZyanUSize& offset, ZyanUSize functionSize, ZyanU8* shuffleKeysData) {
 	ZyanU64 absolute_address;
 	ZyanStatus status = ZydisCalcAbsoluteAddress(&instruction, &operands[0], baseAddress + offset, &absolute_address);
 	if ZYAN_FAILED(status)
@@ -59,29 +54,43 @@ static void processJumpInstruction(ZydisDecoder& decoder, ZydisDecodedInstructio
 				ZyanUSize next_relative_offset = absolute_address - baseAddress;
 
 				if (ZYDIS_MNEMONIC_JB <= next_instruction.mnemonic <= ZYDIS_MNEMONIC_JZ) {
-					printf("looking for retcheck failed address candidates: %llx\n", absolute_address - baseAddress);
+					printf("[*] Looking for retcheck failed address candidates: 0x%llx\n", absolute_address - baseAddress);
 					// If this is the first offset found, store it since it will be a jump to the retcheck failed case
 					if (first_jump_offset == -1) {
 						first_jump_offset = next_relative_offset;
 						retcheck_failed_address = absolute_address;
-						printf("found retcheck failed address: %llx\n", absolute_address - baseAddress);
+						printf("[*] Found retcheck failed address: 0x%llx\n", absolute_address - baseAddress);
 					}
 
 					if (next_relative_offset != first_jump_offset && absolute_address != retcheck_failed_address) {
-						if (shuffleKeysData[next_offset] != 0x0F)
-							shuffleKeysData[next_offset] = 0xEB;
-						if (shuffleKeysData[next_offset] == 0x0F) // longer opcode
+						
+						ZydisEncoderRequest request;
+						memset(&request, 0, sizeof(request));
+						
+						// Initialize the encoder request
+						ZyanUSize encodedLength = ZYDIS_MAX_INSTRUCTION_LENGTH;
+
+						// Define the new instruction data
+						request.mnemonic = ZYDIS_MNEMONIC_JMP;
+						request.branch_type = next_instruction.meta.branch_type;
+						request.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+						request.operand_count = 1;
+						request.operands[0].type = next_operands[0].type;
+						request.operands[0].imm.u = next_operands[0].imm.value.u;
+
+						if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&request, shuffleKeysData + next_offset, &encodedLength)))
 						{
-							shuffleKeysData[next_offset] = 0x90;
-							shuffleKeysData[next_offset + 1] = 0xE9;
+							printf("[-] Failed to encode instruction\n");
+							system("pause");
 						}
-						printf("\tpatched success jump\n");
+						else
+							printf("\t[+] Patched success jump\n");
 						break; // We've found a jnz with a different offset, break out of the loop, since it should be the "retcheck passed" jump
 					}
 					else {
 						for (int i = next_offset; i < next_offset + next_instruction.length; i++)
 							shuffleKeysData[i] = 0x90; // NOP out the jump instructions for the retcheck failed case
-						printf("\tnopped fail jump\n");
+						printf("\t[+] Nopped fail jump\n");
 					}
 				}
 			}
@@ -90,40 +99,46 @@ static void processJumpInstruction(ZydisDecoder& decoder, ZydisDecodedInstructio
 	}
 }
 
-static void removeLeftOverFailureJumps(ZydisDecoder& decoder, ZydisDecodedInstruction& instruction, ZydisDecodedOperand operands[], ZyanU64 baseAddress, ZyanUSize& offset, ZyanUSize functionSize) {
+static void removeLeftOverFailureJumps(ZydisDecoder& decoder, ZydisDecodedInstruction& instruction, ZydisDecodedOperand operands[], ZyanU64 baseAddress, ZyanUSize& offset, ZyanUSize functionSize, ZyanU8* shuffleKeysData) {
 	ZyanU64 absolute_address;
 	ZyanStatus status = ZydisCalcAbsoluteAddress(&instruction, &operands[0], baseAddress + offset, &absolute_address);
 	if ZYAN_FAILED(status)
 		return;
 
 	if (retcheck_failed_address && absolute_address == retcheck_failed_address) {
-		printf("found additional fail jump...\n");
+		printf("[*] Found additional jump to return address check fail...\n");
 		for (int i = offset; i < offset + instruction.length; i++)
 			shuffleKeysData[i] = 0x90;
-		printf("nopped additional fail jump.\n");
+		printf("[+] Nopped additional jump to return address check fail.\n");
 	}
 }
 
-static void createShuffleKeys() {
-	baseAddress = *reinterpret_cast<uint64_t*>(__readgsqword(0x60) + 0x10);
-	uint64_t startAddress = baseAddress + SHUFFLE_KEYS_START;
-	uint64_t endAddress = baseAddress + SHUFFLE_KEYS_END;
+static ZyanU8* createShuffleKeys(uint32_t shuffleKeysRVA) {
+	uint64_t startAddress = ImageBase + shuffleKeysRVA;
+	uint64_t endAddress = ImageBase + shuffleKeysRVA + 0x500; // From looking, we probably dont need any instructions past 0x280 bytes, but just incase lets copy 0x500 bytes
 	size_t functionSize = endAddress - startAddress + 1;
 
-	shuffleKeysData = (ZyanU8*)VirtualAlloc(NULL, functionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	// Allocate an RWX buffer and copy the function into so we can later modify it.
+	// Note: We're allocating RWX memory, which is an easy detection vector, but for the sake of this example, we're going to do it anyways.
+	// Allocating this buffer in an external is perfectly fine, but internally, this is a bad idea, since a warden module *will* find this eventually, unless you can figure out a way to circumvent their checks.
+	ZyanU8* shuffleKeysData = (ZyanU8*)VirtualAlloc(NULL, functionSize, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
 	if (shuffleKeysData == NULL) {
-		printf("Failed to allocate memory\n");
-		return;
+		printf("[-] Failed to allocate memory\n");
+		return nullptr;
 	}
 	memcpy(shuffleKeysData, (void*)startAddress, functionSize);
 
+	// Initialize the decoder context
 	ZydisDecoder decoder;
 	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
-	ZyanUSize offset = 0;
+	// Declare the instruction and operand data structures
 	ZydisDecodedInstruction instruction;
 	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT]; // Added for new API
+	ZyanUSize offset = 0;
 
+	// Walk the function and patch out the various instructions we need to patch out or modify.
+	// i.e. Return address check, lea instructions, et cetera.
 	while (offset < functionSize) {
 		ZyanStatus status = ZydisDecoderDecodeFull(&decoder, reinterpret_cast<void*>(shuffleKeysData + offset), functionSize - offset, &instruction, operands);
 		if (ZYAN_FAILED(status)) {
@@ -131,30 +146,40 @@ static void createShuffleKeys() {
 			continue;
 		}
 
-		// This is a ghetto fix, but basically, they use "lea reg, shufflekeys" to ensure that the shufflekeys address is the one in the game, otherwise the key will be wrong once shuffled...
+		// This is a ghetto fix, but basically, they use "lea REGISTER, shufflekeys" to ensure that the shufflekeys address is the one in the game's memory, otherwise the key will be wrong once shuffled.
+		// This is a measure to prevent us from directly copying the function.
 		ZydisRegister reg = operands[0].reg.value;
+
+		ZydisEncoderRequest request;
+		memset(&request, 0, sizeof(request));
+
 		if (instruction.mnemonic == ZYDIS_MNEMONIC_LEA) {
-			ZyanU8 opcode;
-			switch (reg) {
-			case ZYDIS_REGISTER_RAX: opcode = 0xB8; break;
-			case ZYDIS_REGISTER_RBX: opcode = 0xBB; break;
-			case ZYDIS_REGISTER_RCX: opcode = 0xB9; break;
-			case ZYDIS_REGISTER_RDX: opcode = 0xBA; break;
-			case ZYDIS_REGISTER_RDI: opcode = 0xBF; break;
-			case ZYDIS_REGISTER_RSI: opcode = 0xBE; break;
-			case ZYDIS_REGISTER_RBP: opcode = 0xBD; break;
-			case ZYDIS_REGISTER_RSP: opcode = 0xBC; break;
-			default:
-				break;
+			// Initialize the encoder request
+			ZyanUSize encodedLength = ZYDIS_MAX_INSTRUCTION_LENGTH;
+
+			// Define the new instruction data
+			request.mnemonic = ZYDIS_MNEMONIC_MOV;
+			request.machine_mode = ZYDIS_MACHINE_MODE_LONG_64;
+			request.operand_count = 2;
+			request.operands[0].type = ZYDIS_OPERAND_TYPE_REGISTER;
+			request.operands[0].reg.value = reg;
+			request.operands[1].type = ZYDIS_OPERAND_TYPE_IMMEDIATE;
+			request.operands[1].imm.u = startAddress;
+
+			if (ZYAN_FAILED(ZydisEncoderEncodeInstruction(&request, shuffleKeysData + offset, &encodedLength)))
+			{
+				printf("[-] Failed to encode instruction\n");
+				system("pause");
 			}
-			shuffleKeysData[offset] = 0x48;
-			shuffleKeysData[offset + 1] = opcode;
-			*(uint64_t*)(shuffleKeysData + offset + 2) = startAddress;
+			else {
+				offset += encodedLength;
+				continue;
+			}
 		}
 
-		if (ZYDIS_MNEMONIC_JB <= instruction.mnemonic <= ZYDIS_MNEMONIC_JZ) {
-			processJumpInstruction(decoder, instruction, operands, baseAddress, offset, functionSize);
-		}
+		if (ZYDIS_MNEMONIC_JB <= instruction.mnemonic <= ZYDIS_MNEMONIC_JZ)
+			processJumpInstruction(decoder, instruction, operands, ImageBase, offset, functionSize, shuffleKeysData);
+
 		offset += instruction.length;
 	}
 
@@ -167,35 +192,49 @@ static void createShuffleKeys() {
 		}
 
 		if (ZYDIS_MNEMONIC_JB <= instruction.mnemonic <= ZYDIS_MNEMONIC_JZ)
-			removeLeftOverFailureJumps(decoder, instruction, operands, baseAddress, offset, functionSize);
+			removeLeftOverFailureJumps(decoder, instruction, operands, ImageBase, offset, functionSize, shuffleKeysData);
 		offset += instruction.length;
 	}
+
+	return shuffleKeysData;
 }
 
 static int mainThread(HMODULE hModule)
 {
-	createShuffleKeys();
-	void(__fastcall * fnShuffleKeys)(uint64_t*, uint64_t*) = reinterpret_cast<void(__fastcall*)(uint64_t*, uint64_t*)>(shuffleKeysData);
+	std::string keys_signature = "C8 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 ?? ?? ?? 48 8D ?? ?? ?? 48 B8 ?? ?? ?? ?? ?? ?? ?? ?? 48 89 ?? ?? ?? E8";
+	uintptr_t first_key = arrayscan_module(keys_signature, ImageBase).at(0) + 0x3; // Address of the first key value.
+	if (first_key <= 0x3) {
+		printf("[-] Failed to find pattern\n"); // Should this ever be reached, you will want to find a new signature to scan for, and adjust the offsets that I've hardcoded manually.
+		return 0;
+	}
+	uintptr_t second_key = first_key + 0x14; // Address of the second key value.
+	uintptr_t shuffle_keys = first_key + 0x22; // Shufflekeys function call relative call; we'll use this to calculate the RVA of the function.
 
-	printf("our shufflekeys function: %p\n", shuffleKeysData);
-	printf("ow shufflekeys: %llx\n", baseAddress + SHUFFLE_KEYS_START);
+	uint64_t Key1 = *(uint64_t*)(first_key);
+	uint64_t Key2 = *(uint64_t*)(second_key);
+	uint32_t shuffleKeysRVA = shuffle_keys + 4 + *(uint32_t*)shuffle_keys - ImageBase; // Get the address of the next instruction after the call, and add the relative offset to the function, then subtract the ImageBase to get the function's RVA.
 
-	// Hardcoded, but you could have this entire project dynamically update by finding the shuffle keys function address and the two keys.
-	uint64_t Key1 = 0x73D2DD7AB3E2E0CE;
-	uint64_t Key2 = 0x20405DAF8E8B8108;
+	ZyanU8* shuffleKeysData = createShuffleKeys(shuffleKeysRVA);
+	
+	printf("[+] Cloned ShuffleKeys	: %p\n", shuffleKeysData);
+	printf("[*] Original ShuffleKeys: %llx\n", ImageBase + shuffleKeysRVA);
+	printf("[*] ShuffleKeys Relative Virtual Address: %x\n", shuffleKeysRVA);
 
-	printf("Original Key1: %llx\n", Key1);
-	printf("Original Key2: %llx\n", Key2);
+	printf("[*] Original First Key: %llx\n", Key1);
+	printf("[*] Original Second Key: %llx\n", Key2);
 
-	fnShuffleKeys(&Key2, &Key1);
+	// Create our new shuffle keys function by copying the original function and modifying it.
+	void(*fnShuffleKeys)(uint64_t*, uint64_t*) = reinterpret_cast<void(*)(uint64_t*, uint64_t*)>(shuffleKeysData);
+	if(shuffleKeysData != nullptr)
+		fnShuffleKeys(&Key2, &Key1);
 
-	printf("Shuffled Key1: %llx\n", Key1);
-	printf("Shuffled Key2: %llx\n", Key2);
+	printf("[*] Shuffled First Key: %llx\n", Key1);
+	printf("[*] Shuffled Second Key: %llx\n", Key2);
 
 	return 0;
 }
 
-BOOL WINAPI DllMain(const HMODULE hModule, const DWORD fdwReason, LPVOID lpReserved)
+static BOOL WINAPI DllMain(const HMODULE hModule, const DWORD fdwReason, LPVOID lpReserved)
 {
 
 	if (fdwReason == DLL_PROCESS_ATTACH)
