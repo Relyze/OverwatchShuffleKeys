@@ -229,6 +229,7 @@ static int mainThread(HMODULE hModule)
 		fnShuffleKeys(&Key2, &Key1);
 
 		// Free the allocated memory after since we only have to shuffle the keys once at runtime.
+		// Theoretically if you perform this immediately when the game starts before modules are loaded, you won't have to worry about the region being scanned for, since it'll be freed before warden loads and scans for it.
 		VirtualFree(shuffleKeysData, 0, MEM_RELEASE);
 	}
 
