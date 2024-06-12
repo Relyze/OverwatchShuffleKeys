@@ -225,8 +225,12 @@ static int mainThread(HMODULE hModule)
 
 	// Create our new shuffle keys function by copying the original function and modifying it.
 	void(*fnShuffleKeys)(uint64_t*, uint64_t*) = reinterpret_cast<void(*)(uint64_t*, uint64_t*)>(shuffleKeysData);
-	if(shuffleKeysData != nullptr)
+	if (shuffleKeysData != nullptr) {
 		fnShuffleKeys(&Key2, &Key1);
+
+		// Free the allocated memory after since we only have to shuffle the keys once at runtime.
+		VirtualFree(shuffleKeysData, 0, MEM_RELEASE);
+	}
 
 	printf("[*] Shuffled First Key: %llx\n", Key1);
 	printf("[*] Shuffled Second Key: %llx\n", Key2);
